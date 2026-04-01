@@ -83,13 +83,8 @@ export function validateReadOnlyQuery(sql: string): ValidationResult {
     };
   }
 
-  // Check for SELECT INTO pattern
-  if (/\bSELECT\b[\s\S]*?\bINTO\b\s+(?!#)/i.test(upper)) {
-    // Allow SELECT INTO #temp (temp tables could be useful for CTEs-like patterns)
-    // Actually, block all SELECT INTO for safety
-    if (/\bSELECT\b[^;]*\bINTO\b/i.test(upper)) {
-      return { valid: false, error: 'SELECT INTO is not allowed' };
-    }
+  if (/\bSELECT\b[^;]*\bINTO\b/i.test(upper)) {
+    return { valid: false, error: 'SELECT INTO is not allowed' };
   }
 
   // Check for forbidden keywords as whole words
