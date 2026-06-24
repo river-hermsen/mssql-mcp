@@ -229,12 +229,57 @@ async function openTunnel(): Promise<TunnelState> {
   return state;
 }
 
+// A tunnel is healthy only if the ssh process is still alive AND the local
+// forwarded port still accepts connections. ssh can die (network drop, bastion
+// reboot, session timeout) without us noticing — the cached TunnelState then
+// points at a dead port and every query fails until the process restarts.
+function isTunnelHealthy(t: TunnelState): Promise<boolean> {
+  if (!processAlive(t.sshPid)) {
+    return Promise.resolve(false);
+  }
+  return new Promise((resolve) => {
+    const socket = net.connect(t.localPort, "127.0.0.1");
+    const finish = (ok: boolean) => {
+      socket.destroy();
+      resolve(ok);
+    };
+    socket.once("connect", () => finish(true));
+    socket.once("error", () => finish(false));
+    socket.setTimeout(2000, () => finish(false));
+  });
+}
+
+function teardownTunnel(): void {
+  if (!tunnel) {
+    return;
+  }
+  try {
+    process.kill(tunnel.sshPid, "SIGTERM");
+  } catch {
+    // already gone
+  }
+  try {
+    fs.rmSync(tunnel.askpassDir, { recursive: true, force: true });
+  } catch {
+    // best-effort cleanup
+  }
+  tunnel = null;
+}
+
 async function ensureTunnel(): Promise<TunnelState | null> {
   if (!sshEnabled()) {
     return null;
   }
   if (tunnel) {
-    return tunnel;
+    if (await isTunnelHealthy(tunnel)) {
+      return tunnel;
+    }
+    // Dead tunnel: tear it down and drop every pool bound to its (now stale)
+    // local port. openTunnel() allocates a fresh port, so the pools must be
+    // rebuilt against it — closeAllPools() clears them and getPool() recreates.
+    console.error("SSH tunnel is down; re-establishing.");
+    teardownTunnel();
+    await closeAllPools();
   }
   if (!tunnelPromise) {
     tunnelPromise = openTunnel();
@@ -286,22 +331,44 @@ export async function getPool(database: string): Promise<sql.ConnectionPool> {
   }
 
   // Bring up the SSH tunnel (and run its startup command) before the first
-  // connection. No-op when MSSQL_SSH_HOST is unset.
+  // connection, re-establishing it first if it has died. No-op when
+  // MSSQL_SSH_HOST is unset.
   await ensureTunnel();
 
-  let pool = pools.get(database);
-  if (pool?.connected) {
-    return pool;
+  const existing = pools.get(database);
+  if (existing?.connected) {
+    return existing;
   }
 
-  pool = new sql.ConnectionPool(buildConfig(database));
+  try {
+    return await connectPool(database);
+  } catch (err) {
+    // The tunnel can die between the health-check and connect(). Tear it down,
+    // rebuild it, and retry once before surfacing the error.
+    if (sshEnabled()) {
+      console.error(
+        `Connect to ${database} failed; rebuilding tunnel and retrying once.`,
+      );
+      teardownTunnel();
+      await closeAllPools();
+      await ensureTunnel();
+      return await connectPool(database);
+    }
+    throw err;
+  }
+}
+
+async function connectPool(database: string): Promise<sql.ConnectionPool> {
+  const pool = new sql.ConnectionPool(buildConfig(database));
   await pool.connect();
   pools.set(database, pool);
   console.error(`Connected to database: ${database}`);
   return pool;
 }
 
-export async function closePools(): Promise<void> {
+// Close and forget every pool, leaving the tunnel up. Used when the tunnel is
+// rebuilt on a new local port and the pools must reconnect through it.
+async function closeAllPools(): Promise<void> {
   const closePromises = Array.from(pools.entries()).map(
     async ([name, pool]) => {
       try {
@@ -314,18 +381,9 @@ export async function closePools(): Promise<void> {
   );
   await Promise.all(closePromises);
   pools.clear();
+}
 
-  if (tunnel) {
-    try {
-      process.kill(tunnel.sshPid, "SIGTERM");
-    } catch {
-      // tunnel already gone
-    }
-    try {
-      fs.rmSync(tunnel.askpassDir, { recursive: true, force: true });
-    } catch {
-      // best-effort cleanup
-    }
-    tunnel = null;
-  }
+export async function closePools(): Promise<void> {
+  await closeAllPools();
+  teardownTunnel();
 }
