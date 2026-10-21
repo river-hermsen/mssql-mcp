@@ -57,3 +57,34 @@ Read-only access is enforced through multiple layers:
 4. **Query timeout** — 30-second limit on query execution
 
 **Recommendation**: Use a SQL user with only `db_datareader` role for maximum safety.
+
+## Optional: ClickHouse
+
+The same server can expose read-only ClickHouse access over the HTTP
+interface. Enable it by adding to the `env` block:
+
+```json
+"CLICKHOUSE_SERVERS": "prod=http://clickhouse.example.internal:8123,staging=http://clickhouse-staging.example.internal:8123",
+"CLICKHOUSE_USER": "readonly-user",
+"CLICKHOUSE_PASSWORD": "your-password"
+```
+
+Per-server credentials can be set with `CLICKHOUSE_USER_<NAME>` /
+`CLICKHOUSE_PASSWORD_<NAME>` (server name upper-cased).
+
+Tools (registered only when `CLICKHOUSE_SERVERS` is set):
+
+- **`clickhouse_list_databases`** — List servers (no argument) or databases on a server
+- **`clickhouse_list_tables`** — List tables in a database
+- **`clickhouse_describe_table`** — Get column details for a table
+- **`clickhouse_execute_sql`** — Run a read-only SQL query (SELECT/WITH only)
+
+Security: every request is sent with `readonly=1`, which makes ClickHouse
+itself reject writes, DDL and settings changes server-side; the SELECT/WITH
+validator and a 30s `max_execution_time` apply on top. Use a dedicated
+read-only user, e.g.:
+
+```sql
+CREATE USER 'readonly-user' IDENTIFIED BY '...' SETTINGS readonly = 1 CONST;
+GRANT SHOW, SELECT ON *.* TO 'readonly-user';
+```
