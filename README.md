@@ -88,3 +88,43 @@ read-only user, e.g.:
 CREATE USER 'readonly-user' IDENTIFIED BY '...' SETTINGS readonly = 1 CONST;
 GRANT SHOW, SELECT ON *.* TO 'readonly-user';
 ```
+
+## Optional: PostgreSQL
+
+Set `DB_ENGINE=postgres` to run the server against PostgreSQL instead of
+MSSQL. It then exposes the same four tools (`list_databases`, `list_tables`,
+`describe_table`, `execute_sql`), so register it as its own MCP entry:
+
+```json
+"postgresql-production": {
+  "command": "node",
+  "args": ["/absolute/path/to/mssql-mcp/dist/index.js"],
+  "env": {
+    "DB_ENGINE": "postgres",
+    "PG_SERVERS": "prod01=pg-01.example.internal:5432,prod02=pg-02.example.internal:5432",
+    "PG_USER": "readonly-user",
+    "PG_PASSWORD": "your-password"
+  }
+}
+```
+
+| Variable | Required | Description |
+|---|---|---|
+| `DB_ENGINE` | Yes | `postgres` |
+| `PG_SERVERS` | Yes | Comma-separated `name=host[:port]` pairs (port defaults to 5432) |
+| `PG_USER` / `PG_PASSWORD` | Yes | Credentials for every server; `PG_USER_<NAME>` / `PG_PASSWORD_<NAME>` override per server |
+| `PG_DATABASES` | No | Allowlist; without it every database the user may `CONNECT` to is discovered |
+| `PG_SSL` | No | `require` (default, TLS without certificate check), `verify` or `disable` |
+
+`list_databases` shows which server each database lives on. A server that
+cannot be reached is reported under `unreachable` instead of failing the
+whole call. Without a `schema`, `describe_table` uses the database's
+`search_path` schema.
+
+Security: every query runs in its own `BEGIN READ ONLY` ... `ROLLBACK` over
+the extended protocol, which rejects multiple statements, on sessions opened
+with `default_transaction_read_only=on` and a 30s `statement_timeout`. The
+SELECT/WITH validator applies on top, plus a block on functions that act
+outside the transaction or read server files (`set_config`, `pg_read_file`,
+`lo_import`, `dblink`, `pg_sleep`, advisory locks, ...). Use a role without
+write grants.

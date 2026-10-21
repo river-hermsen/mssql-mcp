@@ -7,6 +7,14 @@ import {
   getClickHouseServers,
   clickHouseQuery,
 } from './clickhouse.js';
+import {
+  postgresEnabled,
+  pgListDatabases,
+  pgListTables,
+  pgDescribeTable,
+  pgExecuteSql,
+  validatePostgresReadOnlyQuery,
+} from './postgres.js';
 
 function textResult(value: unknown) {
   return {
@@ -32,6 +40,18 @@ function errorResult(err: unknown) {
 }
 
 export function registerTools(server: McpServer): void {
+  if (postgresEnabled()) {
+    registerPostgresTools(server);
+  } else {
+    registerMssqlTools(server);
+  }
+
+  if (clickHouseEnabled()) {
+    registerClickHouseTools(server);
+  }
+}
+
+function registerMssqlTools(server: McpServer): void {
   server.registerTool(
     'list_databases',
     {
@@ -211,10 +231,108 @@ export function registerTools(server: McpServer): void {
       }
     }
   );
+}
 
-  if (clickHouseEnabled()) {
-    registerClickHouseTools(server);
-  }
+function registerPostgresTools(server: McpServer): void {
+  server.registerTool(
+    'list_databases',
+    {
+      title: 'List Databases',
+      description:
+        'List the PostgreSQL databases that can be queried, with the server each lives on',
+      annotations: { readOnlyHint: true },
+    },
+    async () => {
+      try {
+        return textResult(await pgListDatabases());
+      } catch (err) {
+        return errorResult(err);
+      }
+    }
+  );
+
+  server.registerTool(
+    'list_tables',
+    {
+      title: 'List Tables',
+      description: 'List all tables and views in a PostgreSQL database',
+      annotations: { readOnlyHint: true },
+      inputSchema: z.object({
+        database: z.string().describe('Database name to list tables from'),
+      }),
+    },
+    async ({ database }) => {
+      try {
+        return textResult(await pgListTables(database));
+      } catch (err) {
+        return errorResult(err);
+      }
+    }
+  );
+
+  server.registerTool(
+    'describe_table',
+    {
+      title: 'Describe Table',
+      description: 'Get column details for a specific PostgreSQL table',
+      annotations: { readOnlyHint: true },
+      inputSchema: z.object({
+        database: z.string().describe('Database name'),
+        table: z.string().describe('Table name'),
+        schema: z
+          .string()
+          .optional()
+          .describe("Schema name (defaults to the database's search_path schema)"),
+      }),
+    },
+    async ({ database, table, schema }) => {
+      try {
+        const rows = await pgDescribeTable(database, table, schema);
+        if (rows.length === 0) {
+          return textResult(
+            `No columns found for table ${schema ? `${schema}.` : ''}${table} in database ${database}`
+          );
+        }
+        return textResult(rows);
+      } catch (err) {
+        return errorResult(err);
+      }
+    }
+  );
+
+  server.registerTool(
+    'execute_sql',
+    {
+      title: 'Execute SQL',
+      description:
+        'Execute a read-only PostgreSQL query (SELECT/WITH only, run in a READ ONLY transaction)',
+      annotations: { readOnlyHint: true },
+      inputSchema: z.object({
+        database: z.string().describe('Database name to query'),
+        query: z.string().describe('Read-only SQL query (SELECT or WITH/CTE only)'),
+      }),
+    },
+    async ({ database, query }) => {
+      const validation = validatePostgresReadOnlyQuery(query);
+      if (!validation.valid) {
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `Query rejected: ${validation.error}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      try {
+        return textResult(await pgExecuteSql(database, query));
+      } catch (err) {
+        return errorResult(err);
+      }
+    }
+  );
 }
 
 function registerClickHouseTools(server: McpServer): void {
